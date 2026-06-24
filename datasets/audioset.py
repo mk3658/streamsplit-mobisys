@@ -288,7 +288,7 @@ def create_audioset_loaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataL
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['server']['training']['batch_size'],
+        batch_size=config['training']['edge']['batch_size'],
         shuffle=True,
         num_workers=4,
         pin_memory=True
@@ -296,7 +296,7 @@ def create_audioset_loaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataL
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config['server']['training']['batch_size'],
+        batch_size=config['training']['edge']['batch_size'],
         shuffle=False,
         num_workers=4,
         pin_memory=True
@@ -304,7 +304,7 @@ def create_audioset_loaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataL
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['server']['training']['batch_size'],
+        batch_size=config['training']['edge']['batch_size'],
         shuffle=False,
         num_workers=4,
         pin_memory=True

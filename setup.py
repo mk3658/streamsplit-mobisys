@@ -8,11 +8,14 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name="streamsplit",
     version="1.0.0",
-    author="StreamSplit Authors",
-    description="Edge-Server Audio Representation Learning with Theoretical Guarantees",
+    author="Minh K. Quan, Pubudu N. Pathirana",
+    description=(
+        "StreamSplit: Continuous Audio Representation Learning via "
+        "Uncertainty-Guided Adaptive Splitting (MobiSys '26)"
+    ),
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/StreamSplit-AAAI",
+    url="https://github.com/mk3658/StreamSplit-AAAI",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -30,8 +33,11 @@ setup(
         "torchaudio>=2.0.0",
         "numpy>=1.24.0",
         "scipy>=1.10.0",
+        "pandas>=2.0.0",
+        "soundfile>=0.12.0",
         "scikit-learn>=1.3.0",
         "matplotlib>=3.7.0",
+        "seaborn>=0.12.0",
         "pyyaml>=6.0",
         "tqdm>=4.65.0",
         "psutil>=5.9.0",
@@ -39,22 +45,15 @@ setup(
     extras_require={
         "dev": [
             "pytest>=7.4.0",
-            "pytest-cov>=4.1.0",
         ],
         "edge": [
             "torch>=2.0.0",
             "torchaudio>=2.0.0",
             "numpy>=1.24.0",
             "scipy>=1.10.0",
+            "soundfile>=0.12.0",
             "pyyaml>=6.0",
             "psutil>=5.9.0",
-        ],
-        "full": [
-            "wandb>=0.15.0",
-            "tensorboard>=2.13.0",
-            "seaborn>=0.12.0",
-            "POT>=0.9.0",
-            "stable-baselines3>=2.0.0",
         ],
     },
 )

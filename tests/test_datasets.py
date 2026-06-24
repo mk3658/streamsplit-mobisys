@@ -165,7 +165,7 @@ def test_data_augmentation():
     print(f"  Std: {waveform.std():.3f}")
     
     # Apply augmentation
-    augmented = augmentor.augment(waveform)
+    augmented = augmentor.augment_waveform(waveform)
     
     print(f"\n✓ Augmented waveform:")
     print(f"  Shape: {augmented.shape}")
@@ -176,7 +176,7 @@ def test_data_augmentation():
     # Test multiple augmentations
     print("\n✓ Testing augmentation variety:")
     for i in range(5):
-        aug = augmentor.augment(waveform)
+        aug = augmentor.augment_waveform(waveform)
         print(f"  Aug {i}: range [{aug.min():.3f}, {aug.max():.3f}], "
               f"mean {aug.mean():.3f}")
     

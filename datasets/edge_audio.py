@@ -435,7 +435,7 @@ def create_edge_loaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataLoade
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['server']['training']['batch_size'] // 4,  # Smaller batch for edge
+        batch_size=config['training']['edge']['batch_size'] // 4,  # Smaller batch for edge
         shuffle=True,
         num_workers=2,
         pin_memory=True
@@ -443,7 +443,7 @@ def create_edge_loaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataLoade
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config['server']['training']['batch_size'] // 4,
+        batch_size=config['training']['edge']['batch_size'] // 4,
         shuffle=False,
         num_workers=2,
         pin_memory=True
@@ -451,7 +451,7 @@ def create_edge_loaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataLoade
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['server']['training']['batch_size'] // 4,
+        batch_size=config['training']['edge']['batch_size'] // 4,
         shuffle=False,
         num_workers=2,
         pin_memory=True

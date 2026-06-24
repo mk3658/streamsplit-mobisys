@@ -1,610 +1,365 @@
 """
-RL-based Computation Splitting Module
+Control Plane: Uncertainty-Guided Adaptive Splitter (paper Sec. 4.2, Table 8).
 
-Implements PPO-based adaptive split point selection for edge-server
-computation partitioning based on resource constraints and performance.
+A PPO agent observes the 3-dim MDP state s_t = [U_t, R_cpu, B_net] (Table 8)
+-- embedding uncertainty (Eq. 11), CPU utilization, and EMA-estimated uplink
+bandwidth -- and selects a split layer k in {0,...,L}, where L is the
+encoder's number of splittable blocks (8 for models.AudioResNet18). The
+reward is Eq. 12:
+
+    r_t = alpha * A_task - beta * (Lat_t / T_max) - eta * (E_t / E_budget)
+
+`SimulatedEdgeCloudEnv` is an offline training environment standing in for
+the paper's "historical traces collected from diverse hardware platforms"
+(Sec. 4.2.3) -- it reproduces the MDP's structure (state/action/reward
+shapes and qualitative trends: later splits cost more latency, more
+uncertain samples benefit more from offloading) but does NOT reproduce the
+paper's measured latency/energy numbers (Tables 2-7), since no
+hardware-in-the-loop trace collection is available in this repository.
 """
 
+from collections import deque
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-import numpy as np
-from typing import Dict, List, Tuple, Optional
-from collections import deque
 
 
-class SplitPointEnv:
-    """
-    Environment for learning optimal split points in edge-server architecture.
-    
-    State: Resource metrics (CPU, memory, battery, network)
-    Action: Split layer index (0=edge only, max=server only)
-    Reward: Weighted combination of accuracy, latency, and resource usage
-    """
-    
-    def __init__(self, config: Dict, resource_monitor, model):
-        """
-        Initialize split point environment.
-        
-        Args:
-            config: Configuration dictionary
-            resource_monitor: ResourceMonitor instance for state observation
-            model: Neural network model with split points
-        """
-        self.config = config['splitting']
-        self.resource_monitor = resource_monitor
-        self.model = model
-        
-        # Split points (MobileNetV3-Small has stages at indices:
-        # 0, 2, 4, 7, 11, 13)
-        split_points_list = config['server']['encoder'].get(
-            'split_points', [0, 2, 4, 7, 11, 13]
-        )
-        self.split_points = split_points_list
-        self.num_actions = len(self.split_points)
-        
-        # State space: CPU, memory, battery, thermal, network latency, network bandwidth
-        self.state_dim = 6
-        
-        # Reward weights
-        self.alpha_accuracy = self.config.get('alpha_accuracy', 0.5)
-        self.alpha_latency = self.config.get('alpha_latency', 0.3)
-        self.alpha_resource = self.config.get('alpha_resource', 0.2)
-        
-        # Performance tracking
-        self.current_accuracy = 0.0
-        self.current_latency = 0.0
-        self.current_resource_usage = 0.0
-        
-        # Episode tracking
+class SimulatedEdgeCloudEnv:
+    """Offline RL training environment implementing Table 8's MDP."""
+
+    def __init__(self, config: Dict, num_blocks: int = 8):
+        cp_config = config['control_plane']
+        self.num_blocks = num_blocks  # L
+        self.num_actions = num_blocks + 1  # k in {0, ..., L}
+        self.state_dim = 3  # [U_t, R_cpu, B_net]
+
+        reward_config = cp_config['reward']
+        self.alpha = reward_config['alpha']
+        self.beta = reward_config['beta']
+        self.eta = reward_config['eta']
+        self.t_max_ms = reward_config['t_max_ms']
+        self.e_budget_mj = reward_config['e_budget_mj']
+
+        self.max_episode_steps = cp_config.get('max_episode_steps', 100)
         self.episode_step = 0
-        self.max_episode_steps = self.config.get('max_episode_steps', 100)
-        
+        self.state = self._sample_state()
+
+    def _sample_state(self) -> np.ndarray:
+        """Draw a fresh (uncertainty, cpu, bandwidth) trace sample."""
+        uncertainty = np.random.uniform(0.0, 1.0)
+        cpu = np.random.uniform(0.1, 1.0)
+        bandwidth = np.random.uniform(0.05, 1.0)
+        return np.array([uncertainty, cpu, bandwidth], dtype=np.float32)
+
     def reset(self) -> np.ndarray:
-        """
-        Reset environment to initial state.
-        
-        Returns:
-            Initial state observation
-        """
+        """Reset to a new episode."""
         self.episode_step = 0
-        self.current_accuracy = 0.0
-        self.current_latency = 0.0
-        self.current_resource_usage = 0.0
-        
-        return self._get_state()
-    
-    def _get_state(self) -> np.ndarray:
-        """
-        Get current state observation.
-        
-        Returns:
-            State vector with normalized resource metrics
-        """
-        # Get resource metrics
-        metrics = self.resource_monitor.get_state()
-        
-        # Normalize to [0, 1]
-        state = np.array([
-            metrics['cpu_util'] / 100.0,           # CPU usage
-            metrics['mem_usage'] / 100.0,          # Memory usage
-            metrics['battery_level'] / 100.0,      # Battery level
-            1.0 if metrics['thermal_throttling'] else 0.0,  # Thermal state
-            np.random.uniform(0.1, 1.0),           # Simulated network latency
-            np.random.uniform(0.5, 1.0),           # Simulated network bandwidth
-        ], dtype=np.float32)
-        
-        return state
-    
+        self.state = self._sample_state()
+        return self.state
+
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
         """
-        Execute action and return next state, reward, done flag.
-        
-        Args:
-            action: Split point index
-            
-        Returns:
-            Tuple of (next_state, reward, done, info)
+        Execute split decision `action` under the current state and return
+        (next_state, reward, done, info).
         """
         self.episode_step += 1
-        
-        # Get split layer
-        split_layer = self.split_points[action]
-        
-        # Simulate performance metrics based on split point
-        # Earlier splits = more edge computation = higher resource usage
-        # Later splits = more server computation = higher latency
-        edge_ratio = action / (self.num_actions - 1)  # 0 = all edge, 1 = all server
-        
-        # Get current resource state
-        state = self._get_state()
-        resource_pressure = (state[0] + state[1]) / 2.0  # CPU + memory
-        
-        # Compute metrics
-        # Accuracy: slightly better with more computation (server)
-        self.current_accuracy = 0.85 + 0.10 * (1 - edge_ratio)
-        
-        # Latency: increases with server computation (network overhead)
-        network_latency = state[4]
-        self.current_latency = 0.01 * edge_ratio + 0.1 * (1 - edge_ratio) * network_latency
-        
-        # Resource usage: higher with edge computation
-        self.current_resource_usage = resource_pressure * (1 - edge_ratio) * 0.3
-        
-        # Compute reward
-        reward = self._compute_reward(action, resource_pressure)
-        
-        # Check termination
+        uncertainty, cpu, bandwidth = self.state
+        edge_ratio = action / self.num_blocks  # 0 = full offload, 1 = full on-device
+
+        # Task accuracy: a server-routing bonus for uncertain samples,
+        # reflecting Sec. 4.2.3's "offloads to the server even at minimal
+        # split depth" behavior for high-uncertainty inputs.
+        offload_bonus = (1 - edge_ratio) * uncertainty
+        accuracy = np.clip(0.7 + 0.2 * offload_bonus, 0.0, 1.0)
+
+        # Latency: edge compute grows with edge_ratio and CPU pressure;
+        # transmission grows with what's offloaded and shrinks with
+        # bandwidth (Sec. 6.2.2's qualitative latency breakdown).
+        edge_compute_ms = 5.0 + 40.0 * edge_ratio * cpu
+        transmit_ms = 5.0 + 80.0 * (1 - edge_ratio) / (bandwidth + 0.05)
+        server_compute_ms = 10.0 * (1 - edge_ratio)
+        latency_ms = edge_compute_ms + transmit_ms + server_compute_ms
+
+        # Energy: edge compute energy grows with edge_ratio; radio energy
+        # dominates for offloaded data (Sec. 6.2.3).
+        energy_mj = 20.0 * edge_ratio + 60.0 * (1 - edge_ratio)
+
+        reward = (
+            self.alpha * accuracy
+            - self.beta * (latency_ms / self.t_max_ms)
+            - self.eta * (energy_mj / self.e_budget_mj)
+        )
+
+        self.state = self._sample_state()
         done = self.episode_step >= self.max_episode_steps
-        
-        # Next state
-        next_state = self._get_state()
-        
+
         info = {
-            'split_layer': split_layer,
-            'accuracy': self.current_accuracy,
-            'latency': self.current_latency,
-            'resource_usage': self.current_resource_usage,
-            'edge_ratio': edge_ratio
+            'split_layer': action,
+            'accuracy': float(accuracy),
+            'latency_ms': float(latency_ms),
+            'energy_mj': float(energy_mj),
+            'edge_ratio': float(edge_ratio),
         }
-        
-        return next_state, reward, done, info
-    
-    def _compute_reward(self, action: int, resource_pressure: float) -> float:
-        """
-        Compute reward for split decision.
-        
-        Args:
-            action: Split point action
-            resource_pressure: Current resource utilization
-            
-        Returns:
-            Scalar reward value
-        """
-        # Reward components
-        r_accuracy = self.current_accuracy  # Higher is better
-        r_latency = 1.0 - self.current_latency  # Lower latency = higher reward
-        r_resource = 1.0 - self.current_resource_usage  # Lower usage = higher reward
-        
-        # Penalty for inappropriate split under resource pressure
-        # If high resource pressure, should use more server (higher action)
-        edge_ratio = action / (self.num_actions - 1)
-        if resource_pressure > 0.7 and edge_ratio < 0.3:
-            # Using too much edge when resources are scarce
-            penalty = -0.5 * (0.7 - edge_ratio)
-        else:
-            penalty = 0.0
-        
-        # Weighted combination
-        reward = (self.alpha_accuracy * r_accuracy +
-                 self.alpha_latency * r_latency +
-                 self.alpha_resource * r_resource +
-                 penalty)
-        
-        return reward
+        return self.state, reward, done, info
 
 
 class ActorCritic(nn.Module):
-    """Actor-Critic network for PPO."""
-    
+    """Shared-trunk actor-critic network for PPO (Sec. 4.2.3)."""
+
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
-        """
-        Initialize actor-critic networks.
-        
-        Args:
-            state_dim: Dimension of state space
-            action_dim: Number of discrete actions
-            hidden_dim: Hidden layer dimension
-        """
         super().__init__()
-        
-        # Shared feature extractor
+
         self.shared = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
-        
-        # Policy head (actor)
         self.policy = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim),
             nn.Softmax(dim=-1)
         )
-        
-        # Value head (critic)
         self.value = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
-        
+
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass through actor-critic.
-        
-        Args:
-            state: State tensor [batch, state_dim]
-            
-        Returns:
-            Tuple of (action_probs, state_value)
-        """
         features = self.shared(state)
-        action_probs = self.policy(features)
-        state_value = self.value(features)
-        
-        return action_probs, state_value
-    
+        return self.policy(features), self.value(features)
+
     def act(self, state: torch.Tensor) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        """
-        Sample action from policy.
-        
-        Args:
-            state: State tensor [state_dim]
-            
-        Returns:
-            Tuple of (action, log_prob, state_value)
-        """
         action_probs, state_value = self.forward(state.unsqueeze(0))
-        action_probs = action_probs.squeeze(0)
-        
-        # Sample action
-        dist = Categorical(action_probs)
+        dist = Categorical(action_probs.squeeze(0))
         action = dist.sample()
-        log_prob = dist.log_prob(action)
-        
-        return action.item(), log_prob, state_value.squeeze(0)
-    
-    def evaluate(self, states: torch.Tensor, 
-                actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Evaluate actions under current policy.
-        
-        Args:
-            states: State tensor [batch, state_dim]
-            actions: Action tensor [batch]
-            
-        Returns:
-            Tuple of (log_probs, state_values, entropy)
-        """
+        return action.item(), dist.log_prob(action), state_value.squeeze(0)
+
+    def evaluate(self, states: torch.Tensor,
+                 actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         action_probs, state_values = self.forward(states)
-        
         dist = Categorical(action_probs)
-        log_probs = dist.log_prob(actions)
-        entropy = dist.entropy()
-        
-        return log_probs, state_values.squeeze(-1), entropy
+        return dist.log_prob(actions), state_values.squeeze(-1), dist.entropy()
 
 
 class PPOSplitAgent:
-    """PPO agent for learning optimal split points."""
-    
-    def __init__(self, config: Dict, env: SplitPointEnv):
-        """
-        Initialize PPO agent.
-        
-        Args:
-            config: Configuration dictionary
-            env: SplitPointEnv instance
-        """
-        self.config = config['splitting']
+    """PPO agent learning the Control Plane's split-point policy."""
+
+    def __init__(self, config: Dict, env: SimulatedEdgeCloudEnv):
+        ppo_config = config['control_plane']['ppo']
         self.env = env
         self.device = torch.device(config['experiment']['device'])
-        
-        # Networks
+
         self.policy = ActorCritic(
             state_dim=env.state_dim,
             action_dim=env.num_actions,
-            hidden_dim=self.config.get('hidden_dim', 128)
+            hidden_dim=ppo_config.get('hidden_dim', 128)
         ).to(self.device)
-        
+
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(),
-            lr=self.config.get('learning_rate', 3e-4)
+            lr=ppo_config.get('learning_rate', 3e-4)
         )
-        
-        # PPO hyperparameters
-        self.gamma = self.config.get('gamma', 0.99)
-        self.lambda_gae = self.config.get('lambda_gae', 0.95)
-        self.epsilon_clip = self.config.get('epsilon_clip', 0.2)
-        self.entropy_coef = self.config.get('entropy_coef', 0.01)
-        self.value_coef = self.config.get('value_coef', 0.5)
-        self.max_grad_norm = self.config.get('max_grad_norm', 0.5)
-        
-        # Training parameters
-        self.update_epochs = self.config.get('update_epochs', 10)
-        self.batch_size = self.config.get('batch_size', 64)
-        
-        # Experience buffer
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.log_probs = []
-        self.values = []
-        self.dones = []
-        
+
+        self.gamma = ppo_config.get('gamma', 0.99)
+        self.lambda_gae = ppo_config.get('lambda_gae', 0.95)
+        self.epsilon_clip = ppo_config.get('epsilon_clip', 0.2)
+        self.entropy_coef = ppo_config.get('entropy_coef', 0.01)
+        self.value_coef = ppo_config.get('value_coef', 0.5)
+        self.max_grad_norm = ppo_config.get('max_grad_norm', 0.5)
+        self.update_epochs = ppo_config.get('update_epochs', 10)
+        self.batch_size = ppo_config.get('batch_size', 64)
+
+        self.states: List = []
+        self.actions: List = []
+        self.rewards: List = []
+        self.log_probs: List = []
+        self.values: List = []
+        self.dones: List = []
+
     def select_action(self, state: np.ndarray) -> int:
-        """
-        Select action using current policy.
-        
-        Args:
-            state: Current state
-            
-        Returns:
-            Selected action index
-        """
+        """Select an action and record the transition's pre-reward fields."""
         state_tensor = torch.FloatTensor(state).to(self.device)
-        
         with torch.no_grad():
             action, log_prob, value = self.policy.act(state_tensor)
-        
-        # Store experience
+
         self.states.append(state)
         self.actions.append(action)
         self.log_probs.append(log_prob.item())
         self.values.append(value.item())
-        
         return action
-    
+
     def store_transition(self, reward: float, done: bool):
-        """
-        Store transition in buffer.
-        
-        Args:
-            reward: Reward received
-            done: Episode termination flag
-        """
+        """Record the reward/done for the most recent select_action() call."""
         self.rewards.append(reward)
         self.dones.append(done)
-    
-    def compute_gae(self, rewards: List[float], 
-                   values: List[float], 
-                   dones: List[bool]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute Generalized Advantage Estimation.
-        
-        Args:
-            rewards: List of rewards
-            values: List of state values
-            dones: List of done flags
-            
-        Returns:
-            Tuple of (advantages, returns)
-        """
-        advantages = []
-        returns = []
-        
-        advantage = 0
-        next_value = 0
-        
+
+    def compute_gae(self, rewards: List[float], values: List[float],
+                     dones: List[bool]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generalized Advantage Estimation."""
+        advantages, returns = [], []
+        advantage, next_value = 0.0, 0.0
+
         for t in reversed(range(len(rewards))):
             mask = 1.0 - dones[t]
-            
-            # TD error
             delta = rewards[t] + self.gamma * next_value * mask - values[t]
-            
-            # GAE
             advantage = delta + self.gamma * self.lambda_gae * advantage * mask
-            
             advantages.insert(0, advantage)
             returns.insert(0, advantage + values[t])
-            
             next_value = values[t]
-        
+
         advantages = torch.FloatTensor(advantages).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
-        
-        # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
         return advantages, returns
-    
-    def update(self):
-        """Update policy using PPO."""
+
+    def update(self) -> Dict:
+        """Update the policy using clipped-surrogate PPO."""
         if len(self.states) == 0:
             return {}
-        
-        # Convert to tensors
+
         states = torch.FloatTensor(np.array(self.states)).to(self.device)
         actions = torch.LongTensor(self.actions).to(self.device)
         old_log_probs = torch.FloatTensor(self.log_probs).to(self.device)
-        
-        # Compute advantages and returns
-        advantages, returns = self.compute_gae(
-            self.rewards, self.values, self.dones
-        )
-        
-        # PPO update
-        total_policy_loss = 0
-        total_value_loss = 0
-        total_entropy = 0
+        advantages, returns = self.compute_gae(self.rewards, self.values, self.dones)
+
+        total_policy_loss = total_value_loss = total_entropy = 0.0
         num_updates = 0
-        
+
         for _ in range(self.update_epochs):
-            # Mini-batch updates
             indices = np.arange(len(states))
             np.random.shuffle(indices)
-            
+
             for start in range(0, len(states), self.batch_size):
-                end = start + self.batch_size
-                batch_indices = indices[start:end]
-                
-                batch_states = states[batch_indices]
-                batch_actions = actions[batch_indices]
-                batch_old_log_probs = old_log_probs[batch_indices]
-                batch_advantages = advantages[batch_indices]
-                batch_returns = returns[batch_indices]
-                
-                # Evaluate actions
-                log_probs, state_values, entropy = self.policy.evaluate(
-                    batch_states, batch_actions
+                batch_idx = indices[start:start + self.batch_size]
+
+                log_probs, values, entropy = self.policy.evaluate(
+                    states[batch_idx], actions[batch_idx]
                 )
-                
-                # Ratio for PPO
-                ratios = torch.exp(log_probs - batch_old_log_probs)
-                
-                # Clipped surrogate objective
-                surr1 = ratios * batch_advantages
-                surr2 = torch.clamp(ratios, 1 - self.epsilon_clip, 
-                                   1 + self.epsilon_clip) * batch_advantages
+                ratios = torch.exp(log_probs - old_log_probs[batch_idx])
+                surr1 = ratios * advantages[batch_idx]
+                surr2 = torch.clamp(
+                    ratios, 1 - self.epsilon_clip, 1 + self.epsilon_clip
+                ) * advantages[batch_idx]
+
                 policy_loss = -torch.min(surr1, surr2).mean()
-                
-                # Value loss
-                value_loss = F.mse_loss(state_values, batch_returns)
-                
-                # Entropy bonus
+                value_loss = F.mse_loss(values, returns[batch_idx])
                 entropy_loss = -entropy.mean()
-                
-                # Total loss
-                loss = (policy_loss + 
-                       self.value_coef * value_loss + 
-                       self.entropy_coef * entropy_loss)
-                
-                # Update
+
+                loss = (policy_loss + self.value_coef * value_loss
+                        + self.entropy_coef * entropy_loss)
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     self.policy.parameters(), self.max_grad_norm
                 )
                 self.optimizer.step()
-                
+
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy += entropy.mean().item()
                 num_updates += 1
-        
-        # Clear buffer
+
         self.states.clear()
         self.actions.clear()
         self.rewards.clear()
         self.log_probs.clear()
         self.values.clear()
         self.dones.clear()
-        
+
+        n = max(num_updates, 1)
         return {
-            'policy_loss': total_policy_loss / max(num_updates, 1),
-            'value_loss': total_value_loss / max(num_updates, 1),
-            'entropy': total_entropy / max(num_updates, 1)
+            'policy_loss': total_policy_loss / n,
+            'value_loss': total_value_loss / n,
+            'entropy': total_entropy / n,
         }
-    
+
     def save(self, path: str):
-        """Save policy checkpoint."""
         torch.save({
             'policy_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
         }, path)
-    
+
     def load(self, path: str):
-        """Load policy checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
 
 class SplitController:
-    """Controller for runtime split point decisions using trained RL agent."""
-    
-    def __init__(self, config: Dict, resource_monitor, policy_path: Optional[str] = None):
-        """
-        Initialize split controller.
-        
-        Args:
-            config: Configuration dictionary
-            resource_monitor: ResourceMonitor instance
-            policy_path: Path to trained policy checkpoint
-        """
-        self.config = config
-        self.resource_monitor = resource_monitor
+    """
+    Runtime split-point controller using a trained policy.
+
+    Deployment-time callers supply the real measured state components --
+    U_t from DistributionalMemory.entropy(), R_cpu and B_net from
+    ResourceMonitor -- rather than the simulated environment used only for
+    offline PPO training.
+    """
+
+    def __init__(self, config: Dict, num_blocks: int = 8,
+                 policy_path: Optional[str] = None):
+        self.num_blocks = num_blocks
         self.device = torch.device(config['experiment']['device'])
-        
-        # Split points
-        split_points_list = config['server']['encoder'].get(
-            'split_points', [0, 2, 4, 7, 11, 13]
-        )
-        self.split_points = split_points_list
-        
-        # Policy network
+
         self.policy = ActorCritic(
-            state_dim=6,  # CPU, memory, battery, thermal, latency, bandwidth
-            action_dim=len(self.split_points),
-            hidden_dim=config['splitting'].get('hidden_dim', 128)
+            state_dim=3,
+            action_dim=num_blocks + 1,
+            hidden_dim=config['control_plane']['ppo'].get('hidden_dim', 128)
         ).to(self.device)
-        
-        # Load trained policy
+
         if policy_path:
             self.load_policy(policy_path)
-        
         self.policy.eval()
-        
-        # Decision history
+
         self.history = deque(maxlen=100)
-        
-    def get_split_layer(self, network_metrics: Optional[Dict] = None) -> int:
+
+    def get_split_layer(self, uncertainty: float, cpu_util: float,
+                         bandwidth_mbps: float,
+                         bandwidth_norm_mbps: float = 50.0) -> int:
         """
-        Get optimal split layer based on current state.
-        
         Args:
-            network_metrics: Optional network condition metrics
-            
+            uncertainty: U_t in [0, log C] from DistributionalMemory.entropy()
+            cpu_util: R_cpu in [0, 1] from ResourceMonitor
+            bandwidth_mbps: Raw B_net estimate in Mbps from ResourceMonitor
+            bandwidth_norm_mbps: Bandwidth value treated as "1.0" for
+                normalization (deployment-specific link capacity)
+
         Returns:
-            Split layer index
+            Split layer index k in {0, ..., L}
         """
-        # Get resource state
-        metrics = self.resource_monitor.get_state()
-        
-        # Build state vector
-        state = np.array([
-            metrics['cpu_util'] / 100.0,
-            metrics['mem_usage'] / 100.0,
-            metrics['battery_level'] / 100.0,
-            1.0 if metrics['thermal_throttling'] else 0.0,
-            network_metrics.get('latency', 0.5) if network_metrics else 0.5,
-            network_metrics.get('bandwidth', 0.8) if network_metrics else 0.8,
-        ], dtype=np.float32)
-        
-        # Get action from policy
+        bandwidth_norm = min(bandwidth_mbps / bandwidth_norm_mbps, 1.0)
+        state = np.array([uncertainty, cpu_util, bandwidth_norm], dtype=np.float32)
         state_tensor = torch.FloatTensor(state).to(self.device)
-        
+
         with torch.no_grad():
             action_probs, _ = self.policy(state_tensor.unsqueeze(0))
-            action = torch.argmax(action_probs, dim=-1).item()
-        
-        split_layer = self.split_points[action]
-        
-        # Store decision
-        self.history.append({
-            'state': state,
-            'action': action,
-            'split_layer': split_layer,
-            'resource_pressure': (
-                (metrics['cpu_util'] + metrics['mem_usage']) / 200.0
-            )
-        })
-        
+            split_layer = torch.argmax(action_probs, dim=-1).item()
+
+        self.history.append({'state': state, 'split_layer': split_layer})
         return split_layer
-    
+
     def load_policy(self, path: str):
-        """Load trained policy."""
         checkpoint = torch.load(path, map_location=self.device)
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
-        print(f"Loaded trained policy from {path}")
-    
+
     def get_statistics(self) -> Dict:
-        """Get decision statistics."""
+        """Summary statistics over recent split decisions."""
         if not self.history:
             return {}
-        
-        actions = [h['action'] for h in self.history]
+
         split_layers = [h['split_layer'] for h in self.history]
-        resource_pressures = [h['resource_pressure'] for h in self.history]
-        
         return {
-            'avg_split_layer': np.mean(split_layers),
-            'std_split_layer': np.std(split_layers),
-            'action_distribution': np.bincount(actions, minlength=len(self.split_points)).tolist(),
-            'avg_resource_pressure': np.mean(resource_pressures),
-            'num_decisions': len(self.history)
+            'avg_split_layer': float(np.mean(split_layers)),
+            'std_split_layer': float(np.std(split_layers)),
+            'split_distribution': np.bincount(
+                split_layers, minlength=self.num_blocks + 1
+            ).tolist(),
+            'num_decisions': len(self.history),
         }

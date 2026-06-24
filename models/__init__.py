@@ -1,5 +1,5 @@
 """Models module initialization."""
 
-from .mobilenet_v3 import MobileNetV3Small
+from .resnet1d import AudioResNet18
 
-__all__ = ['MobileNetV3Small']
+__all__ = ['AudioResNet18']

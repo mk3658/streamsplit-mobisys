@@ -1,42 +1,73 @@
-# StreamSplit: Theoretical Guarantees for Edge Audio Learning
+# StreamSplit: Continuous Audio Representation Learning via Uncertainty-Guided Adaptive Splitting
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Official implementation of **StreamSplit: Theoretical Guarantees for Edge Audio Learning** (AAAI 2026).
+Reference implementation accompanying:
+
+> Minh K. Quan and Pubudu N. Pathirana. **StreamSplit: Continuous Audio
+> Representation Learning via Uncertainty-Guided Adaptive Splitting.**
+> *The 24th ACM International Conference on Mobile Systems, Applications and
+> Services (MobiSys '26)*, June 21-25, 2026, Cambridge, United Kingdom.
 
 ## Overview
 
-StreamSplit enables efficient audio representation learning on edge devices through three key innovations:
+StreamSplit makes streaming contrastive learning practical on heterogeneous
+edge devices by resolving two conflicts:
 
-1. **Streaming Contrastive Learning** - Distribution-based learning with convergence guarantees
-2. **Hybrid Loss Function** - Laplacian regularization + Sliced-Wasserstein distance
-3. **RL-Guided Computation Splitting** - PPO-based adaptive workload division
+1. **The Stream-Clip Mismatch (Sec. 4.1)** -- a **distribution-based
+   streaming framework** replaces explicit negative-sample storage with a
+   compact Gaussian Mixture Model (`<35KB`), synthesizing *virtual*
+   negatives via boundary-aware sampling so small on-device batches don't
+   degrade representation quality.
+2. **The Volatility Conflict (Sec. 4.2)** -- an **Uncertainty-Guided
+   Adaptive Splitter** uses a lightweight PPO policy to dynamically choose
+   the edge/server split point from real-time CPU load, network bandwidth,
+   and the GMM's embedding-uncertainty signal (a zero-cost byproduct of
+   step 1).
 
-### Key Results
-- 77.1% bandwidth reduction, 72.6% latency reduction, 52.3% energy savings
-- Within 2.2% accuracy of server-only baseline
-- Training: 4.01 → 2.33 loss (41.8% improvement, 100 epochs)
+A **Cloud Refiner (Sec. 4.3)** completes the loop: it maintains a sliding
+Temporal Buffer of received embeddings and applies a Hybrid Loss (Diversity
+via Sliced-Wasserstein + Affinity via Laplacian regularization) to keep the
+global manifold smooth and well-spread despite asynchronous, sometimes
+sparse updates from the edge.
 
 ## Architecture
 
+This repo mirrors the paper's three coupled subsystems (Figure 1):
+
 ```
-┌─────────────────┐         ┌──────────────────┐
-│  Edge Device    │◄───────►│  Server          │
-│  - Audio FFT    │         │  - Aggregation   │
-│  - Local Loss   │         │  - Hybrid Loss   │
-│  - Memory Bank  │         │  - Refinement    │
-│  - RL Agent     │         │  - Prototypes    │
-└─────────────────┘         └──────────────────┘
+Edge Learner (edge/)              Control Plane (edge/rl_splitting.py,    Cloud Refiner (server/)
+  audio_processing.py               edge/resource_monitor.py)               temporal_buffer.py
+  distributional_memory.py        PPO agent: s_t=[U_t, R_cpu, B_net]        hybrid_loss.py
+  contrastive_learning.py         -> split layer k in {0,...,L}            refiner.py
+        |                                    |                                  |
+        +------ embeddings/uncertainty ------+------ split features -----------+
+                                                          encoder: models/resnet1d.py
 ```
 
-**Core Innovation**: PPO-based RL agent (`edge/rl_splitting.py`, 609 lines) dynamically selects optimal split points (layers 0,2,4,7,11,13) in MobileNetV3 based on resource constraints and network conditions.
+## Paper -> Code Mapping
+
+| Paper reference | Code |
+|---|---|
+| Eq. 7: GMM distributional memory | `edge/distributional_memory.py::DistributionalMemory` |
+| Eq. 9: boundary-aware virtual negative sampling | `DistributionalMemory.sample_virtual_negatives` |
+| Eq. 10: streaming InfoNCE with virtual negatives | `edge/contrastive_learning.py::StreamingContrastiveLearning` |
+| Eq. 11: embedding uncertainty U_t | `DistributionalMemory.entropy` |
+| Table 8: Control Plane MDP (state/action/reward) | `edge/rl_splitting.py::SimulatedEdgeCloudEnv` |
+| Eq. 12: reward function | `SimulatedEdgeCloudEnv.step` |
+| Sec. 4.3.1: Temporal Buffer, temporal k-NN graph | `server/temporal_buffer.py::TemporalBuffer` |
+| Eq. 1/3: Sliced-Wasserstein Diversity | `server/hybrid_loss.py::SlicedWassersteinDistance` |
+| Eq. 4/6/14: Laplacian Affinity | `server/hybrid_loss.py::LaplacianRegularization` |
+| Eq. 13: Hybrid Loss | `server/hybrid_loss.py::HybridLoss` |
+| Sec. 4.3.3: Lazy Synchronization | `server/refiner.py::LazySync` |
+| Sec. 5: ResNet-18-1D, L=8 splittable blocks | `models/resnet1d.py::AudioResNet18` |
 
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/StreamSplit-AAAI.git
+git clone https://github.com/mk3658/StreamSplit-AAAI.git
 cd StreamSplit-AAAI
 python3 -m venv venv
 source venv/bin/activate
@@ -50,82 +81,114 @@ pip install -r requirements.txt
 python scripts/download_audioset.py
 python scripts/prepare_edge_data.py
 
-# 2. Train the system (100 epochs, ~2h on CPU)
+# 2. Verify the installation
+python demo.py        # Edge Learner + Cloud Refiner components
+python demo_rl.py      # Control Plane (RL) components
+
+# 3. Train the Edge Learner + Cloud Refiner (Phase 1 + 3)
 python train.py --config configs/streamsplit.yaml
 
-# 3. Run tests
-python demo.py  # All 12 tests should pass
+# 4. Train the Control Plane's PPO split policy (Phase 2)
+python train_rl.py --config configs/streamsplit.yaml
+
+# 5. Run the test suite
+pytest tests/ -v
 ```
-
-**Training Results**: Loss reduces from 4.01 → 2.33 over 100 epochs (41.8% improvement). Checkpoints saved every 10 epochs to `./checkpoints/` (162MB each).
-
-**Pre-trained Models**: Download from [Zenodo](https://zenodo.org/PLACEHOLDER) or [Hugging Face](https://huggingface.co/PLACEHOLDER)
 
 ## Project Structure
 
 ```
 StreamSplit-AAAI/
-├── edge/                      # Edge device modules
-│   ├── rl_splitting.py        # PPO-based split controller (609 lines)
-│   ├── contrastive_learning.py# Distribution-based loss
-│   ├── memory_bank.py         # Prototype memory
-│   └── audio_processing.py    # FFT, MFCC
-├── server/                    # Server modules
-│   ├── hybrid_loss.py         # Laplacian + Sliced-Wasserstein
-│   └── aggregation.py         # Multi-device aggregation
+├── edge/                          # Edge Learner + Control Plane (Sec. 4.1-4.2)
+│   ├── audio_processing.py        # Mel-spectrogram extraction + augmentation
+│   ├── distributional_memory.py   # GMM + boundary-aware virtual negatives (Eq. 7-9, 11)
+│   ├── contrastive_learning.py    # Streaming InfoNCE (Eq. 10)
+│   ├── resource_monitor.py        # CPU + bandwidth EMA (R_cpu, B_net)
+│   └── rl_splitting.py            # PPO Control Plane (Table 8, Eq. 12)
+├── server/                        # Cloud Refiner (Sec. 4.3)
+│   ├── temporal_buffer.py         # Sliding window + temporal k-NN graph
+│   ├── hybrid_loss.py             # Sliced-Wasserstein + Laplacian (Eq. 13)
+│   └── refiner.py                 # ServerRefiner + Lazy Synchronization
 ├── models/
-│   └── mobilenet_v3.py        # Encoder with split points
+│   └── resnet1d.py                # AudioResNet18, L=8 splittable blocks
 ├── datasets/
 │   ├── audioset.py
 │   └── edge_audio.py
-├── train.py                   # Main training script
-├── demo.py                    # Component tests
-└── configs/
-    └── streamsplit.yaml       # Hyperparameters
+├── train.py                       # Phase 1 + 3 training
+├── train_rl.py                    # Phase 2 (Control Plane) training
+├── demo.py / demo_rl.py           # Component smoke tests
+├── tests/                         # Unit tests
+└── configs/streamsplit.yaml       # Hyperparameters (annotated with paper section/eq. refs)
 ```
 
 ## Configuration
 
-Key hyperparameters in `configs/streamsplit.yaml`:
+`configs/streamsplit.yaml` is annotated inline with the paper section or
+equation each value comes from. Key defaults:
 
 ```yaml
-training:
-  num_epochs: 100
+encoder:
+  num_blocks: 8        # L
+  embedding_dim: 128    # d
 
 edge:
-  batch_size: 200
-  learning_rate: 0.0001  # 1e-4
-  fft_window_ms: 25
-  temperature: 0.1
-  feature_dim: 128
-  memory_bank_size: [64, 512]
+  distributional_memory:
+    num_components: 64  # C
+    tau: 0.1             # boundary-aware sampling temperature (Eq. 9)
+  contrastive:
+    n_syn: 256           # virtual negatives per anchor
 
-server:
-  batch_size: 256
-  learning_rate: 0.0005  # 5e-4
-  lambda_laplacian: 0.5
-  num_projections: 100
+control_plane:
+  reward:
+    alpha: 10
+    beta: 5
+    eta: 3
 
-rl:
-  algorithm: "ppo"
-  gamma: 0.99
-  hidden_dim: 128
-  momentum: 0.999
+hybrid_loss:
+  num_projections: 50   # M
+  lambda_sw: 0.1
+  lambda_lap: 0.01
+  window: 100             # W
+  k_neighbors: 5
 ```
 
-## Hardware Requirements
+## Scope & Known Simplifications
 
-- **Edge**: Raspberry Pi 4B (4GB RAM) or equivalent
-- **Server**: 8+ cores, 32GB RAM, NVIDIA GPU (optional)
-- **Tested on**: macOS (Apple Silicon), Ubuntu 20.04/22.04, Raspberry Pi 4B
+This is a single-machine reference implementation intended for studying and
+extending the algorithms, not a byte-for-byte reproduction of the paper's
+hardware deployment:
+
+- **Network/CPU conditions are emulated in Python**, not via Raspberry Pi +
+  Linux `tc` hardware-in-the-loop as in the paper's evaluation (Sec. 6). The
+  Control Plane's PPO agent (`edge/rl_splitting.py::SimulatedEdgeCloudEnv`)
+  trains against a lightweight simulator that reproduces the MDP's
+  structure and qualitative trends, not the paper's measured latency/energy
+  traces.
+- **`train.py` runs Phase 1 and Phase 3 in one process**: embeddings reach
+  the Cloud Refiner's Temporal Buffer detached from the encoder's
+  computation graph, so the reported Hybrid Loss is a diagnostic of
+  representation quality (Diversity/Affinity drift), not a second
+  backpropagation pass through the encoder.
+- **Table 8's temporal graph edge weights** (`W_ij`) are left uniform
+  (1.0); Definition 2 (Sec. 3.2) does not specify a weighting kernel for
+  the temporal adjacency graph beyond "connect temporally adjacent frames."
+- **Accuracy/latency/energy numbers in Tables 2-7 are the paper's reported
+  hardware results** (Raspberry Pi 4B / Apple M2 / cloud GPU server) and
+  have not been re-verified by this codebase.
+
+## Hardware Requirements (for the paper's evaluation, not this repo's defaults)
+
+- **Edge**: Raspberry Pi 4B (4GB RAM) or equivalent ARM device
+- **Server**: GPU optional; the reference implementation here runs on CPU
+- **Tested on**: macOS (Apple Silicon), Linux
 
 ## Citation
 
 ```bibtex
-@inproceedings{streamsplit2026,
-  title={StreamSplit: Theoretical Guarantees for Edge Audio Learning},
-  author={Anonymous},
-  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+@inproceedings{quan2026streamsplit,
+  title={StreamSplit: Continuous Audio Representation Learning via Uncertainty-Guided Adaptive Splitting},
+  author={Quan, Minh K. and Pathirana, Pubudu N.},
+  booktitle={Proceedings of the 24th Annual International Conference on Mobile Systems, Applications and Services (MobiSys '26)},
   year={2026}
 }
 ```
@@ -133,7 +196,3 @@ rl:
 ## License
 
 MIT License - see [LICENSE](LICENSE) file.
-
-## Acknowledgments
-
-Built on PyTorch, AudioSet, MobileNetV3, and PPO. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
